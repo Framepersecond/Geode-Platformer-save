@@ -1,0 +1,26 @@
+{
+  "geode": "5.7.1",
+  "gd": {
+    "win": "2.2081"
+  },
+  "id": "frxme.platformer-save",
+  "name": "Platformer Save",
+  "version": "v1.0.0",
+  "developer": "Frxme",
+  "description": "Save and restore Geometry Dash platformer checkpoints with accurate quit-time resume.",
+  "tags": ["enhancement", "gameplay"],
+  "settings": {
+    "enabled": {
+      "name": "Enabled",
+      "description": "Save and restore platformer level checkpoints.",
+      "type": "bool",
+      "default": true
+    },
+    "remove-save-on-complete": {
+      "name": "Remove Save on Complete",
+      "description": "Delete the saved run when the level is completed. Leave this off to keep saves until you delete them manually.",
+      "type": "bool",
+      "default": false
+    }
+  }
+}
