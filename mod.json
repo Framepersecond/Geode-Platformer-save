@@ -4,11 +4,14 @@
     "win": "2.2081"
   },
   "id": "frxme.platformer-save",
-  "name": "Platformer Save",
-  "version": "v1.0.0",
+  "name": "Platformer Progression Save",
+  "version": "v1.0.5",
   "developer": "Frxme",
   "description": "Save and restore Geometry Dash platformer checkpoints with accurate quit-time resume.",
   "tags": ["enhancement", "gameplay"],
+  "dependencies": {
+    "sabe.persistenceapi": ">=v1.2.0"
+  },
   "settings": {
     "enabled": {
       "name": "Enabled",

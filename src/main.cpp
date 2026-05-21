@@ -1,5 +1,6 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/CheckpointObject.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/LevelInfoLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -8,7 +9,9 @@
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
 #include <Geode/binding/CheckpointGameObject.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
+#include <Geode/binding/EffectGameObject.hpp>
 #include <Geode/binding/GameObject.hpp>
+#include <Geode/binding/GJBaseGameLayer.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/binding/GradientTriggerObject.hpp>
 #include <Geode/binding/LevelInfoLayer.hpp>
@@ -24,7 +27,7 @@
 #include <Geode/cocos/platform/CCPlatformMacros.h>
 #include <Geode/utils/string.hpp>
 
-#include <PersistenceAPI.hpp>
+#include <sabe.persistenceapi/include/PersistenceAPI.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -230,8 +233,10 @@ inline void operator<<(persistenceAPI::Stream& stream, PlatformerSaveCheckpointO
 
 namespace {
     constexpr char kMagic[] = { 'F', 'P', 'S', 'A', 'V', 'E', '2', '\0' };
-    constexpr int kSaveFormatVersion = 3;
+    constexpr int kSaveFormatVersion = 4;
     constexpr int kPAVersion = 2;
+    constexpr int kRestoreTriggerBlockFrames = 8;
+    constexpr float kRestoreTriggerBlockDistance = 96.f;
 
 #if defined(GEODE_IS_WINDOWS)
     constexpr int kUniqueIDOffset = 0x6ba158;
@@ -250,11 +255,15 @@ namespace {
     std::unordered_map<int, RunChoice> g_pendingChoices;
     std::unordered_map<PlayLayer*, std::vector<int>> g_activatedCheckpointUIDs;
     std::unordered_map<PlayLayer*, GameObject*> g_hiddenCheckpointObjects;
+    std::unordered_map<GJBaseGameLayer*, int> g_restoreTriggerBlocks;
+    std::unordered_map<GJBaseGameLayer*, cocos2d::CCPoint> g_restorePositions;
 
     struct LoadedRuntimeData {
         cocos2d::CCPoint position = { 0.f, 0.f };
         CheckpointObject* checkpoint = nullptr;
         bool objectStateApplied = false;
+        bool hasGameState = false;
+        GJGameState gameState;
         double timePlayed = 0.0;
         double levelTime = 0.0;
         double totalTime = 0.0;
@@ -282,7 +291,7 @@ namespace {
         std::error_code ec;
         std::filesystem::create_directories(directory, ec);
         if (ec) {
-            log::warn("Platformer Save could not create save directory {}: {}", pathToString(directory), ec.message());
+            log::warn("Platformer Progression Save could not create save directory {}: {}", pathToString(directory), ec.message());
             return false;
         }
         return true;
@@ -335,7 +344,7 @@ namespace {
 
         int formatVersion = 0;
         stream >> formatVersion;
-        if (formatVersion == 2 || formatVersion == kSaveFormatVersion) {
+        if (formatVersion >= 2 && formatVersion <= kSaveFormatVersion) {
             return formatVersion;
         }
         return 0;
@@ -381,9 +390,17 @@ namespace {
     std::optional<std::filesystem::path> firstReadableSavePath(int id) {
         for (bool persistent : { true, false }) {
             auto path = savePath(id, persistent);
-            if (existingFileWithMinSize(path, 1)) {
+            if (!existingFileWithMinSize(path, sizeof(kMagic) + sizeof(bool) + sizeof(int))) {
+                continue;
+            }
+
+            Stream stream;
+            if (stream.setFile(pathToString(path), kPAVersion) && readHeader(stream)) {
+                stream.end();
                 return path;
             }
+            stream.end();
+            log::warn("Skipping unreadable Platformer Progression Save file {}", pathToString(path));
         }
         return std::nullopt;
     }
@@ -409,6 +426,41 @@ namespace {
             !layer->m_hasCompletedLevel &&
             !layer->m_inResetDelay &&
             (!layer->m_player1 || !layer->m_player1->m_isDead);
+    }
+
+    bool shouldSuppressRestoreTrigger(GJBaseGameLayer* layer, PlayerObject* player, EffectGameObject* object) {
+        if (!enabled() || !layer || !player || !object || !object->m_isTrigger) return false;
+
+        auto block = g_restoreTriggerBlocks.find(layer);
+        if (block == g_restoreTriggerBlocks.end() || block->second <= 0) return false;
+
+        auto playLayer = typeinfo_cast<PlayLayer*>(layer);
+        if (!playLayer || !playLayer->m_level || !playLayer->m_level->isPlatformer()) return false;
+
+        auto position = player->getPosition();
+        if (auto saved = g_restorePositions.find(layer); saved != g_restorePositions.end()) {
+            auto dx = position.x - saved->second.x;
+            auto dy = position.y - saved->second.y;
+            if ((dx * dx) + (dy * dy) > kRestoreTriggerBlockDistance * kRestoreTriggerBlockDistance) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void clearRestoreTriggerBlock(GJBaseGameLayer* layer) {
+        g_restoreTriggerBlocks.erase(layer);
+        g_restorePositions.erase(layer);
+    }
+
+    void tickRestoreTriggerBlock(GJBaseGameLayer* layer) {
+        auto block = g_restoreTriggerBlocks.find(layer);
+        if (block == g_restoreTriggerBlocks.end()) return;
+
+        if (--block->second <= 0) {
+            clearRestoreTriggerBlock(layer);
+        }
     }
 
     bool shouldPreserveCheckpointAudio(PlayLayer* layer) {
@@ -457,9 +509,54 @@ namespace {
 
     int activeCheckpointUID(PlayLayer* layer, CheckpointObject* checkpoint) {
         if (!layer || !checkpoint) return 0;
-        if (layer->m_activatedCheckpoint) return layer->m_activatedCheckpoint->m_uniqueID;
         if (checkpoint->m_physicalCheckpointObject) return checkpoint->m_physicalCheckpointObject->m_uniqueID;
+        if (checkpoint->m_uniqueID != 0) return checkpoint->m_uniqueID;
+        if (layer->m_activatedCheckpoint) return layer->m_activatedCheckpoint->m_uniqueID;
         return 0;
+    }
+
+    std::vector<int> activatedUIDsThroughCheckpoint(PlayLayer* layer, int checkpointUID) {
+        std::vector<int> result;
+        if (!layer) return result;
+
+        auto it = g_activatedCheckpointUIDs.find(layer);
+        if (it != g_activatedCheckpointUIDs.end()) {
+            for (auto uid : it->second) {
+                if (uid == 0) continue;
+                if (std::find(result.begin(), result.end(), uid) == result.end()) {
+                    result.push_back(uid);
+                }
+                if (checkpointUID != 0 && uid == checkpointUID) {
+                    return result;
+                }
+            }
+        }
+
+        if (checkpointUID != 0 && std::find(result.begin(), result.end(), checkpointUID) == result.end()) {
+            result.push_back(checkpointUID);
+        }
+        return result;
+    }
+
+    void trimActivatedUIDsToCheckpoint(std::vector<int>& uids, int checkpointUID) {
+        if (checkpointUID == 0) return;
+
+        std::vector<int> trimmed;
+        for (auto uid : uids) {
+            if (uid == 0) continue;
+            if (std::find(trimmed.begin(), trimmed.end(), uid) == trimmed.end()) {
+                trimmed.push_back(uid);
+            }
+            if (uid == checkpointUID) {
+                uids = std::move(trimmed);
+                return;
+            }
+        }
+
+        if (std::find(trimmed.begin(), trimmed.end(), checkpointUID) == trimmed.end()) {
+            trimmed.push_back(checkpointUID);
+        }
+        uids = std::move(trimmed);
     }
 
     GameObject* createHiddenCheckpointObject(cocos2d::CCPoint position) {
@@ -477,6 +574,23 @@ namespace {
         return object;
     }
 
+    bool finalizeSaveWrite(std::filesystem::path const& tempPath, std::filesystem::path const& path) {
+        std::error_code ec;
+        std::filesystem::rename(tempPath, path, ec);
+        if (!ec) return true;
+
+        ec.clear();
+        std::filesystem::copy_file(tempPath, path, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            log::warn("Platformer Progression Save could not finalize {}: {}", pathToString(path), ec.message());
+            return false;
+        }
+
+        ec.clear();
+        std::filesystem::remove(tempPath, ec);
+        return true;
+    }
+
     bool writeSaveFile(std::filesystem::path const& path, PlayLayer* layer, CheckpointObject* checkpoint) {
         if (!layer || !layer->m_level || !checkpoint || !checkpoint->m_player1Checkpoint || !checkpoint->m_physicalCheckpointObject) {
             return false;
@@ -486,20 +600,20 @@ namespace {
         }
 
         auto psCheckpoint = static_cast<PlatformerSaveCheckpointObject*>(checkpoint);
-        auto oldLevelTime = checkpoint->m_gameState.m_levelTime;
-        auto oldTotalTime = checkpoint->m_gameState.m_totalTime;
         auto oldTimePlayed = psCheckpoint->m_fields->m_timePlayed;
         auto oldTimestamp = psCheckpoint->m_fields->m_timestamp;
 
-        checkpoint->m_gameState.m_levelTime = layer->m_gameState.m_levelTime;
-        checkpoint->m_gameState.m_totalTime = layer->m_gameState.m_totalTime;
         psCheckpoint->m_fields->m_timePlayed = layer->m_timePlayed;
         psCheckpoint->m_fields->m_timestamp = nowMillis();
 
+        auto tempPath = path;
+        tempPath += ".tmp";
+
+        std::error_code ec;
+        std::filesystem::remove(tempPath, ec);
+
         Stream stream;
-        if (!stream.setFile(pathToString(path), kPAVersion, true)) {
-            checkpoint->m_gameState.m_levelTime = oldLevelTime;
-            checkpoint->m_gameState.m_totalTime = oldTotalTime;
+        if (!stream.setFile(pathToString(tempPath), kPAVersion, true)) {
             psCheckpoint->m_fields->m_timePlayed = oldTimePlayed;
             psCheckpoint->m_fields->m_timestamp = oldTimestamp;
             return false;
@@ -514,7 +628,7 @@ namespace {
         stream << hash;
         stream << checkpointUID;
 
-        auto& activatedUIDs = g_activatedCheckpointUIDs[layer];
+        auto activatedUIDs = activatedUIDsThroughCheckpoint(layer, checkpointUID);
         auto activatedCount = static_cast<unsigned int>(activatedUIDs.size());
         stream << activatedCount;
         for (auto uid : activatedUIDs) {
@@ -534,15 +648,15 @@ namespace {
             stream << emptyTimers;
         }
         stream << layer->m_attempts;
+        reinterpret_cast<PAGJGameState*>(&checkpoint->m_gameState)->save(stream);
 
         markHeaderFinished(stream);
         stream.end();
 
-        checkpoint->m_gameState.m_levelTime = oldLevelTime;
-        checkpoint->m_gameState.m_totalTime = oldTotalTime;
         psCheckpoint->m_fields->m_timePlayed = oldTimePlayed;
         psCheckpoint->m_fields->m_timestamp = oldTimestamp;
-        return true;
+
+        return finalizeSaveWrite(tempPath, path);
     }
 
     void saveCheckpoint(PlayLayer* layer, CheckpointObject* checkpoint) {
@@ -559,7 +673,7 @@ namespace {
         }
 
         if (!wroteAny) {
-            log::warn("Platformer Save could not write checkpoint for level {}", id);
+            log::warn("Platformer Progression Save could not write checkpoint for level {}", id);
         }
     }
 
@@ -571,6 +685,43 @@ namespace {
         if (auto checkpoint = layer->getLastCheckpoint()) {
             saveCheckpoint(layer, checkpoint);
         }
+    }
+
+    void applySavedPlayerState(PlayLayer* layer, LoadedRuntimeData const& data) {
+        if (!layer || !data.checkpoint) return;
+
+        if (layer->m_player1 && data.checkpoint->m_player1Checkpoint) {
+            auto position = data.checkpoint->m_player1Checkpoint->m_position;
+            layer->m_player1->setStartPos(position);
+            layer->m_player1->setPosition(position);
+            layer->m_player1->m_lastPosition = data.checkpoint->m_player1Checkpoint->m_lastPosition;
+            layer->m_player1->m_startPosition = position;
+        }
+        if (layer->m_player2 && data.checkpoint->m_player2Checkpoint) {
+            auto position = data.checkpoint->m_player2Checkpoint->m_position;
+            layer->m_player2->setStartPos(position);
+            layer->m_player2->setPosition(position);
+            layer->m_player2->m_lastPosition = data.checkpoint->m_player2Checkpoint->m_lastPosition;
+            layer->m_player2->m_startPosition = position;
+        }
+    }
+
+    void applySavedRuntimeState(PlayLayer* layer, LoadedRuntimeData const& data) {
+        if (!layer) return;
+
+        if (data.hasGameState) {
+            layer->m_gameState = data.gameState;
+        }
+        if (layer->m_effectManager) {
+            layer->m_effectManager->m_persistentItemCountMap = data.persistentItemCountMap;
+            layer->m_effectManager->m_persistentTimerItemSet = data.persistentTimerItemSet;
+        }
+        layer->m_attempts = data.attempts;
+        layer->m_timePlayed = data.timePlayed;
+        layer->m_gameState.m_levelTime = data.levelTime;
+        layer->m_gameState.m_totalTime = data.totalTime;
+        applySavedPlayerState(layer, data);
+        layer->updateCamera(0.f);
     }
 
     void applyLoadedRuntimeData(PlayLayer* layer, bool erase) {
@@ -586,17 +737,7 @@ namespace {
             g_restoringLayers.erase(layer);
             data.objectStateApplied = true;
         }
-        if (layer->m_effectManager) {
-            layer->m_effectManager->m_persistentItemCountMap = data.persistentItemCountMap;
-            layer->m_effectManager->m_persistentTimerItemSet = data.persistentTimerItemSet;
-        }
-        layer->m_attempts = data.attempts;
-        layer->m_timePlayed = data.timePlayed;
-        layer->m_gameState.m_levelTime = data.levelTime;
-        layer->m_gameState.m_totalTime = data.totalTime;
-        if (layer->m_player1) {
-            layer->m_player1->setStartPos(data.position);
-        }
+        applySavedRuntimeState(layer, data);
 
         if (erase) {
             g_loadedRuntimeData.erase(it);
@@ -651,7 +792,7 @@ namespace {
         }
 
         if (savedLevelHash != 0 && savedLevelHash != levelHash(layer->m_level)) {
-            log::warn("Loading Platformer Save for level {} even though the level string changed", savedLevelID);
+            log::warn("Loading Platformer Progression Save for level {} even though the level string changed", savedLevelID);
         }
 
         auto checkpoint = static_cast<PlatformerSaveCheckpointObject*>(CheckpointObject::create());
@@ -667,7 +808,15 @@ namespace {
         stream >> persistentItemCountMap;
         stream >> persistentTimerItemSet;
         stream >> attempts;
+
+        if (saveVersion >= 4) {
+            GJGameState ignoredQuitState = checkpoint->m_gameState;
+            reinterpret_cast<PAGJGameState*>(&ignoredQuitState)->load(stream);
+        }
         stream.end();
+
+        auto savedCheckpointUID = checkpoint->m_uniqueID != 0 ? checkpoint->m_uniqueID : checkpointUID;
+        trimActivatedUIDsToCheckpoint(activatedUIDs, savedCheckpointUID);
 
         auto hiddenCheckpoint = createHiddenCheckpointObject(checkpoint->m_fields->m_position);
         if (!hiddenCheckpoint) return false;
@@ -697,13 +846,17 @@ namespace {
         LoadedRuntimeData data;
         data.position = checkpoint->m_fields->m_position;
         data.checkpoint = checkpoint;
+        data.hasGameState = true;
+        data.gameState = checkpoint->m_gameState;
         data.timePlayed = checkpoint->m_fields->m_timePlayed;
-        data.levelTime = checkpoint->m_gameState.m_levelTime;
-        data.totalTime = checkpoint->m_gameState.m_totalTime;
+        data.levelTime = data.gameState.m_levelTime;
+        data.totalTime = data.gameState.m_totalTime;
         data.attempts = attempts;
         data.persistentItemCountMap = persistentItemCountMap;
         data.persistentTimerItemSet = persistentTimerItemSet;
         g_loadedRuntimeData[layer] = data;
+        g_restoreTriggerBlocks[layer] = kRestoreTriggerBlockFrames;
+        g_restorePositions[layer] = data.position;
 
         return true;
     }
@@ -712,6 +865,7 @@ namespace {
     protected:
         LevelInfoLayer* m_infoLayer = nullptr;
         int m_levelID = 0;
+        bool m_continueToLevel = false;
 
         bool setup(LevelInfoLayer* layer, bool saveExists) {
             constexpr float width = 340.f;
@@ -723,7 +877,7 @@ namespace {
 
             this->setID("save-choice-popup"_spr);
             m_buttonMenu->setID("save-choice-menu"_spr);
-            this->setTitle("Platformer Save", "goldFont.fnt", .62f, 20.f);
+            this->setTitle("Platformer Progression Save", "goldFont.fnt", .46f, 20.f);
 
             auto text = CCLabelBMFont::create(
                 saveExists ? "Saved Run Found" : "No Saved Run",
@@ -766,15 +920,31 @@ namespace {
             m_buttonMenu->addChild(button);
         }
 
+        void releaseLevelInfoLayer() {
+            if (m_levelID != 0) {
+                g_pendingChoices.erase(m_levelID);
+            }
+            if (!m_infoLayer) return;
+
+            g_bypassPlayPrompt.erase(m_infoLayer);
+            m_infoLayer->m_isBusy = false;
+            m_infoLayer->setKeypadEnabled(true);
+            m_infoLayer->setTouchEnabled(true);
+            if (m_infoLayer->m_playBtnMenu) {
+                m_infoLayer->m_playBtnMenu->setEnabled(true);
+            }
+        }
+
         void onChoice(cocos2d::CCObject* sender) {
             auto tag = sender ? sender->getTag() : 2;
             if (tag == 4) {
                 if (m_levelID != 0) {
                     deleteSave(m_levelID);
                 }
+                auto infoLayer = m_infoLayer;
                 this->onClose(nullptr);
-                if (m_infoLayer) {
-                    if (auto popup = SaveChoicePopup::create(m_infoLayer, false)) {
+                if (infoLayer) {
+                    if (auto popup = SaveChoicePopup::create(infoLayer, false)) {
                         popup->show();
                     }
                 }
@@ -787,13 +957,21 @@ namespace {
                 g_bypassPlayPrompt.insert(m_infoLayer);
             }
             if (m_infoLayer) {
+                m_continueToLevel = true;
                 m_infoLayer->runAction(cocos2d::CCSequence::create(
                     cocos2d::CCDelayTime::create(.05f),
-                    cocos2d::CCCallFunc::create(m_infoLayer, callfunc_selector(LevelInfoLayer::playStep3)),
+                    cocos2d::CCCallFunc::create(m_infoLayer, callfunc_selector(LevelInfoLayer::playStep4)),
                     nullptr
                 ));
             }
             this->onClose(nullptr);
+        }
+
+        void onClose(cocos2d::CCObject* sender) override {
+            if (!m_continueToLevel) {
+                releaseLevelInfoLayer();
+            }
+            Popup::onClose(sender);
         }
 
     public:
@@ -818,18 +996,37 @@ namespace {
     }
 }
 
+class $modify(PlatformerSaveBaseGameLayer, GJBaseGameLayer) {
+    bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
+        if (shouldSuppressRestoreTrigger(this, player, object)) {
+            return false;
+        }
+        return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
+    }
+
+    void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
+        if (shouldSuppressRestoreTrigger(this, player, object)) {
+            return;
+        }
+        GJBaseGameLayer::playerTouchedTrigger(player, object);
+    }
+};
+
 class $modify(PlatformerSaveLevelInfoLayer, LevelInfoLayer) {
-    void playStep3() {
+    void playStep4() {
         if (g_bypassPlayPrompt.erase(this) > 0 || hasPendingChoice(this)) {
-            LevelInfoLayer::playStep3();
+            LevelInfoLayer::playStep4();
             return;
         }
         if (showSaveChoice(this)) return;
-        LevelInfoLayer::playStep3();
+        LevelInfoLayer::playStep4();
     }
 
     void onExit() {
         g_bypassPlayPrompt.erase(this);
+        if (auto id = levelKey(this->m_level); id != 0) {
+            g_pendingChoices.erase(id);
+        }
         LevelInfoLayer::onExit();
     }
 };
@@ -843,6 +1040,7 @@ class $modify(PlatformerSavePlayLayer, PlayLayer) {
         bool m_inSetupHasCompleted = false;
         bool m_inResetLevel = false;
         bool m_blockSaveUntilReset = false;
+        int m_restoreFramesRemaining = 0;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -883,7 +1081,9 @@ class $modify(PlatformerSavePlayLayer, PlayLayer) {
     void setupHasCompleted() {
         if (m_fields->m_shouldLoad) {
             m_fields->m_shouldLoad = false;
-            restoreSaveBeforeSetup(this);
+            if (restoreSaveBeforeSetup(this)) {
+                m_fields->m_restoreFramesRemaining = 4;
+            }
         }
 
         m_fields->m_inSetupHasCompleted = true;
@@ -907,7 +1107,11 @@ class $modify(PlatformerSavePlayLayer, PlayLayer) {
         m_fields->m_inPostUpdate = true;
         m_fields->m_triedPlacingCheckpoint = m_tryPlaceCheckpoint;
         PlayLayer::postUpdate(dt);
-        applyLoadedRuntimeData(this, true);
+        if (m_fields->m_restoreFramesRemaining > 0) {
+            --m_fields->m_restoreFramesRemaining;
+            applyLoadedRuntimeData(this, m_fields->m_restoreFramesRemaining == 0);
+        }
+        tickRestoreTriggerBlock(this);
         m_fields->m_inPostUpdate = false;
         m_fields->m_triedPlacingCheckpoint = false;
     }
@@ -1006,6 +1210,8 @@ class $modify(PlatformerSavePlayLayer, PlayLayer) {
         g_loadedRuntimeData.erase(this);
         g_activatedCheckpointUIDs.erase(this);
         g_hiddenCheckpointObjects.erase(this);
+        clearRestoreTriggerBlock(this);
+        m_fields->m_restoreFramesRemaining = 0;
         PlayLayer::onExit();
     }
 
@@ -1017,6 +1223,7 @@ class $modify(PlatformerSavePlayLayer, PlayLayer) {
             g_activeSaveRuns.erase(this);
             g_activatedCheckpointUIDs.erase(this);
             g_hiddenCheckpointObjects.erase(this);
+            clearRestoreTriggerBlock(this);
         }
         PlayLayer::levelComplete();
     }
